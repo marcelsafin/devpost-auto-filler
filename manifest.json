@@ -5,27 +5,16 @@
   "description": "Fyller automatiskt i Devpost-inlämningar med ett klick.",
   "permissions": [
     "activeTab",
-    "scripting",
-    "storage"
+    "scripting"
   ],
   "host_permissions": [
     "https://*.devpost.com/*",
     "https://devpost.com/*"
   ],
-  "background": {
-    "service_worker": "setup.js"
-  },
   "content_scripts": [
     {
       "matches": ["https://*.devpost.com/*", "https://devpost.com/*"],
-      "js": ["content_script.js"],
-      "css": ["styles.css"]
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["services/geminiService.js"],
-      "matches": ["https://*.devpost.com/*"]
+      "js": ["content_script.js"]
     }
   ]
 }

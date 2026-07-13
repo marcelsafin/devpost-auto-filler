@@ -1,9 +1,0 @@
-/* Vi kan lägga till lite CSS för att göra knappen snyggare */
-#auto-fill-button:hover {
-  opacity: 0.8;
-}
-
-#auto-fill-button:disabled {
-  background-color: #999;
-  cursor: not-allowed;
-}
