@@ -34,6 +34,7 @@ jobs:
           COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
           HTTP_STATUS = re.compile(r"^HTTP/\d(?:\.\d+)?\s+([1-5]\d\d)(?:\s|$)")
           ALLOWED_DIRECTORIES = ["/"]
+          ALLOWED_PREFIXES = []
 
 
           class OperationalError(RuntimeError):
@@ -50,21 +51,32 @@ jobs:
 
 
           def is_patch_update(title):
-              if not isinstance(title, str):
+              if not isinstance(title, str) or "\n" in title or "\r" in title:
                   return False
-              match = BUMP_TITLE.fullmatch(title)
-              if match is None:
-                  return False
-              previous = parse_version(match.group(2))
-              current = parse_version(match.group(3))
-              directory = match.group(4) or "/"
-              return (
-                  previous is not None
-                  and current is not None
-                  and previous[:2] == current[:2]
-                  and current[2] > previous[2]
-                  and directory in ALLOWED_DIRECTORIES
-              )
+              candidates = ((None, title),) if title.startswith("Bump ") else ()
+              if not candidates:
+                  candidates = []
+                  for configured_directory, prefix in ALLOWED_PREFIXES:
+                      marker = f"{prefix}: "
+                      if title.startswith(marker):
+                          candidates.append((configured_directory, title[len(marker):]))
+              for configured_directory, bump_title in candidates:
+                  match = BUMP_TITLE.fullmatch(bump_title)
+                  if match is None:
+                      continue
+                  previous = parse_version(match.group(2))
+                  current = parse_version(match.group(3))
+                  directory = match.group(4) or "/"
+                  if (
+                      previous is not None
+                      and current is not None
+                      and previous[:2] == current[:2]
+                      and current[2] > previous[2]
+                      and directory in ALLOWED_DIRECTORIES
+                      and (configured_directory is None or configured_directory == directory)
+                  ):
+                      return True
+              return False
 
 
           def repository_name(ref):
