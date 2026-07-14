@@ -30,8 +30,10 @@ jobs:
           from urllib.parse import urlencode
 
           SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
-          BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)$")
+          BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)(?: in (\S+))?$")
           COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+          HTTP_STATUS = re.compile(r"^HTTP/\d(?:\.\d+)?\s+([1-5]\d\d)(?:\s|$)")
+          ALLOWED_DIRECTORIES = ('/',)
 
 
           class OperationalError(RuntimeError):
@@ -55,11 +57,13 @@ jobs:
                   return False
               previous = parse_version(match.group(2))
               current = parse_version(match.group(3))
+              directory = match.group(4) or "/"
               return (
                   previous is not None
                   and current is not None
                   and previous[:2] == current[:2]
                   and current[2] > previous[2]
+                  and directory in ALLOWED_DIRECTORIES
               )
 
 
@@ -101,9 +105,9 @@ jobs:
               )
 
 
-          def run(command):
+          def run(command, input=None):
               try:
-                  return subprocess.run(command, check=False, capture_output=True, text=True)
+                  return subprocess.run(command, check=False, capture_output=True, text=True, input=input)
               except OSError as error:
                   raise OperationalError("could not execute gh") from error
 
@@ -119,6 +123,47 @@ jobs:
                   return json.loads(result.stdout)
               except json.JSONDecodeError:
                   raise OperationalError(f"API request returned invalid JSON for {endpoint}") from None
+
+
+          def merge_response(result, number):
+              output = result.stdout
+              if not isinstance(output, str):
+                  raise OperationalError(f"merge API response is malformed for PR #{number}")
+              headers, separator, body = output.replace("\r\n", "\n").partition("\n\n")
+              status_line = headers.split("\n", 1)[0] if headers else ""
+              match = HTTP_STATUS.match(status_line)
+              if not separator or match is None:
+                  if result.returncode:
+                      raise OperationalError(f"merge API request failed for PR #{number} (gh exit {result.returncode})")
+                  raise OperationalError(f"merge API response is malformed for PR #{number}")
+              try:
+                  payload = json.loads(body)
+              except json.JSONDecodeError:
+                  raise OperationalError(f"merge API response is malformed for PR #{number}") from None
+              if not isinstance(payload, dict):
+                  raise OperationalError(f"merge API response is malformed for PR #{number}")
+              status = int(match.group(1))
+              if result.returncode and status < 400:
+                  raise OperationalError(f"merge API request failed for PR #{number} (gh exit {result.returncode})")
+              return status, payload
+
+
+          def direct_merge(number, head_sha, repository):
+              payload = json.dumps({"sha": head_sha, "merge_method": "squash"})
+              result = run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "PUT",
+                      "--include",
+                      "--input",
+                      "-",
+                      f"repos/{repository}/pulls/{number}/merge",
+                  ],
+                  input=payload,
+              )
+              return merge_response(result, number)
 
 
           def pull_request_is_ready(pull_request):
@@ -170,44 +215,47 @@ jobs:
                           log(f"PR #{number} not ready; retry later")
                           continue
 
-                      result = merge(number, head_sha)
-                      if result.returncode == 0:
+                      try:
+                          status, response = merge(number, head_sha)
+                      except (TypeError, ValueError):
+                          raise OperationalError(f"merge API response is malformed for PR #{number}") from None
+                      if type(status) is not int or not isinstance(response, dict):
+                          raise OperationalError(f"merge API response is malformed for PR #{number}")
+                      if status == 200:
+                          if response.get("merged") is not True:
+                              raise OperationalError(f"merge API response for PR #{number} did not report merged true")
                           log(f"PR #{number} merged")
                           continue
 
                       refreshed = request(f"repos/{repository}/pulls/{number}")
+                      if not isinstance(refreshed, dict):
+                          raise OperationalError(f"refreshed pull request data is malformed for PR #{number}")
                       refreshed_head_sha = pull_request_head_sha(refreshed)
-                      if refreshed_head_sha is not None and refreshed_head_sha != head_sha:
+                      if refreshed_head_sha is None:
+                          raise OperationalError(f"refreshed pull request data is malformed for PR #{number}")
+                      if status in {405, 409} and refreshed_head_sha != head_sha:
                           log(f"PR #{number} head changed before merge; skipped")
                           continue
-                      if not (
+                      if status in {405, 409} and not (
                           is_eligible_pull_request(refreshed, repository, default_branch)
                           and is_patch_update(refreshed.get("title"))
                       ):
-                          raise OperationalError(f"merge failed for PR #{number} after PR state changed")
-                      if not pull_request_is_ready(refreshed):
+                          log(f"PR #{number} changed before merge; skipped")
+                          continue
+                      if status == 409:
+                          log(f"PR #{number} head SHA conflict; skipped")
+                          continue
+                      if status == 405:
                           log(f"PR #{number} not ready; retry later")
                           continue
-                      raise OperationalError(f"merge failed for PR #{number} (gh exit {result.returncode})")
+                      raise OperationalError(f"merge API request failed for PR #{number} (status {status})")
 
 
           def main():
               repository = os.environ.get("GITHUB_REPOSITORY", "")
 
               def merge(number, head_sha):
-                  return run(
-                      [
-                          "gh",
-                          "pr",
-                          "merge",
-                          "--repo",
-                          repository,
-                          "--squash",
-                          "--match-head-commit",
-                          head_sha,
-                          str(number),
-                      ]
-                  )
+                  return direct_merge(number, head_sha, repository)
 
               try:
                   scan(api, merge, repository, print)
