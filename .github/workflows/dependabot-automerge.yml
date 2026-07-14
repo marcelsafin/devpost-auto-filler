@@ -4,30 +4,160 @@
 
 name: dependabot-automerge
 on:
-  pull_request:
+  schedule:
+    - cron: "17 * * * *"
 permissions:
   pull-requests: write
   contents: write
 concurrency:
-  group: dependabot-automerge-${{ github.event.pull_request.number }}
+  group: dependabot-automerge
   cancel-in-progress: true
 jobs:
   automerge:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.actor == 'dependabot[bot]'
-    permissions:
-      pull-requests: write
-      contents: write
     steps:
-      - name: Fetch Dependabot metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2
-        with:
-          github-token: "${{ secrets.GITHUB_TOKEN }}"
-      - name: Enable auto-merge for semver-patch only
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
-        run: gh pr merge --auto --squash "$PR_URL"
+      - name: Enable auto-merge for semantic patch Dependabot updates
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from urllib.parse import urlencode
+
+          SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+          BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)$")
+          COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+          def parse_version(value):
+              if not isinstance(value, str):
+                  return None
+              match = SEMVER.fullmatch(value)
+              if match is None:
+                  return None
+              return tuple(int(part) for part in match.groups())
+
+
+          def is_patch_update(title):
+              if not isinstance(title, str):
+                  return False
+              match = BUMP_TITLE.fullmatch(title)
+              if match is None:
+                  return False
+              previous = parse_version(match.group(2))
+              current = parse_version(match.group(3))
+              return (
+                  previous is not None
+                  and current is not None
+                  and previous[:2] == current[:2]
+                  and current[2] > previous[2]
+              )
+
+
+          def repository_name(ref):
+              if not isinstance(ref, dict):
+                  return None
+              repo = ref.get("repo")
+              if not isinstance(repo, dict):
+                  return None
+              return repo.get("full_name")
+
+
+          def is_eligible_pull_request(pull_request, repository, default_branch):
+              if not isinstance(pull_request, dict) or pull_request.get("state") != "open":
+                  return False
+              user = pull_request.get("user")
+              if not isinstance(user, dict) or user.get("login") != "dependabot[bot]":
+                  return False
+              base = pull_request.get("base")
+              head = pull_request.get("head")
+              return (
+                  isinstance(base, dict)
+                  and base.get("ref") == default_branch
+                  and repository_name(base) == repository
+                  and repository_name(head) == repository
+                  and isinstance(head, dict)
+                  and isinstance(head.get("sha"), str)
+                  and COMMIT_SHA.fullmatch(head["sha"]) is not None
+              )
+
+
+          def api(endpoint, paginate=False):
+              command = ["gh", "api"]
+              if paginate:
+                  command.extend(["--paginate", "--slurp"])
+              try:
+                  result = subprocess.run(command + [endpoint], check=False, capture_output=True, text=True)
+              except OSError:
+                  return None
+              if result.returncode:
+                  return None
+              try:
+                  return json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  return None
+
+
+          def scan(request, merge, repository):
+              if not isinstance(repository, str) or not repository:
+                  return
+              details = request(f"repos/{repository}")
+              if not isinstance(details, dict):
+                  return
+              default_branch = details.get("default_branch")
+              if not isinstance(default_branch, str) or not default_branch:
+                  return
+              query = urlencode({"state": "open", "base": default_branch, "per_page": "100"})
+              pages = request(f"repos/{repository}/pulls?{query}", paginate=True)
+              if not isinstance(pages, list):
+                  return
+              for page in pages:
+                  if not isinstance(page, list):
+                      continue
+                  for summary in page:
+                      if not isinstance(summary, dict):
+                          continue
+                      number = summary.get("number")
+                      if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                          continue
+                      pull_request = request(f"repos/{repository}/pulls/{number}")
+                      if (
+                          is_eligible_pull_request(pull_request, repository, default_branch)
+                          and is_patch_update(pull_request.get("title"))
+                      ):
+                          merge(number, pull_request["head"]["sha"])
+
+
+          def main():
+              repository = os.environ.get("GITHUB_REPOSITORY", "")
+
+              def enable_auto_merge(number, head_sha):
+                  try:
+                      subprocess.run(
+                          [
+                              "gh",
+                              "pr",
+                              "merge",
+                              "--repo",
+                              repository,
+                              "--auto",
+                              "--squash",
+                              "--match-head-commit",
+                              head_sha,
+                              str(number),
+                          ],
+                          check=False,
+                      )
+                  except OSError:
+                      pass
+
+              scan(api, enable_auto_merge, repository)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
         env:
-          PR_URL: "${{ github.event.pull_request.html_url }}"
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
