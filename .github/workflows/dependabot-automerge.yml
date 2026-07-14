@@ -4,6 +4,7 @@
 
 name: dependabot-automerge
 on:
+  workflow_dispatch:
   schedule:
     - cron: "17 * * * *"
 permissions:
@@ -14,21 +15,28 @@ concurrency:
   cancel-in-progress: true
 jobs:
   automerge:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Enable auto-merge for semantic patch Dependabot updates
+      - name: Merge ready semantic patch Dependabot updates
         run: |
           python3 - <<'PY'
           import json
           import os
           import re
           import subprocess
+          import sys
           from urllib.parse import urlencode
 
           SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
           BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)$")
           COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+          READY_CHECK_BUCKETS = {"pass", "skipping"}
+
+
+          class OperationalError(RuntimeError):
+              pass
 
 
           def parse_version(value):
@@ -65,6 +73,18 @@ jobs:
               return repo.get("full_name")
 
 
+          def pull_request_head_sha(pull_request):
+              if not isinstance(pull_request, dict):
+                  return None
+              head = pull_request.get("head")
+              if not isinstance(head, dict):
+                  return None
+              sha = head.get("sha")
+              if not isinstance(sha, str) or COMMIT_SHA.fullmatch(sha) is None:
+                  return None
+              return sha
+
+
           def is_eligible_pull_request(pull_request, repository, default_branch):
               if not isinstance(pull_request, dict) or pull_request.get("state") != "open":
                   return False
@@ -78,86 +98,170 @@ jobs:
                   and base.get("ref") == default_branch
                   and repository_name(base) == repository
                   and repository_name(head) == repository
-                  and isinstance(head, dict)
-                  and isinstance(head.get("sha"), str)
-                  and COMMIT_SHA.fullmatch(head["sha"]) is not None
+                  and pull_request_head_sha(pull_request) is not None
               )
+
+
+          def run(command):
+              try:
+                  return subprocess.run(command, check=False, capture_output=True, text=True)
+              except OSError as error:
+                  raise OperationalError("could not execute gh") from error
 
 
           def api(endpoint, paginate=False):
               command = ["gh", "api"]
               if paginate:
                   command.extend(["--paginate", "--slurp"])
-              try:
-                  result = subprocess.run(command + [endpoint], check=False, capture_output=True, text=True)
-              except OSError:
-                  return None
+              result = run(command + [endpoint])
               if result.returncode:
-                  return None
+                  raise OperationalError(f"API request failed for {endpoint} (gh exit {result.returncode})")
               try:
                   return json.loads(result.stdout)
               except json.JSONDecodeError:
-                  return None
+                  raise OperationalError(f"API request returned invalid JSON for {endpoint}") from None
 
 
-          def scan(request, merge, repository):
+          def required_checks_are_ready(number, repository):
+              result = run(
+                  [
+                      "gh",
+                      "pr",
+                      "checks",
+                      "--repo",
+                      repository,
+                      str(number),
+                      "--required",
+                      "--json",
+                      "bucket",
+                  ]
+              )
+              try:
+                  checks = json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  raise OperationalError(f"required-check query returned invalid JSON for PR #{number}") from None
+              if not isinstance(checks, list) or any(
+                  not isinstance(check, dict) or not isinstance(check.get("bucket"), str) for check in checks
+              ):
+                  raise OperationalError(f"required-check query returned malformed data for PR #{number}")
+
+              buckets = {check["bucket"] for check in checks}
+              if result.returncode == 0:
+                  if buckets <= READY_CHECK_BUCKETS:
+                      return True
+              elif result.returncode == 8:
+                  if "pending" in buckets:
+                      return False
+              elif result.returncode == 1:
+                  if buckets & {"fail", "cancel"}:
+                      return False
+              raise OperationalError(f"required-check query failed for PR #{number} (gh exit {result.returncode})")
+
+
+          def pull_request_is_ready(pull_request):
+              mergeable = pull_request.get("mergeable")
+              mergeable_state = pull_request.get("mergeable_state")
+              if type(mergeable) not in (bool, type(None)) or not isinstance(mergeable_state, str):
+                  raise OperationalError("pull request readiness data is malformed")
+              return mergeable is True and mergeable_state == "clean"
+
+
+          def scan(request, requirements_ready, merge, repository, log):
               if not isinstance(repository, str) or not repository:
-                  return
+                  raise OperationalError("GITHUB_REPOSITORY is missing or invalid")
               details = request(f"repos/{repository}")
               if not isinstance(details, dict):
-                  return
+                  raise OperationalError("repository API response is malformed")
               default_branch = details.get("default_branch")
               if not isinstance(default_branch, str) or not default_branch:
-                  return
+                  raise OperationalError("repository API response has no default branch")
               query = urlencode({"state": "open", "base": default_branch, "per_page": "100"})
               pages = request(f"repos/{repository}/pulls?{query}", paginate=True)
               if not isinstance(pages, list):
-                  return
+                  raise OperationalError("pull request list API response is malformed")
               for page in pages:
                   if not isinstance(page, list):
-                      continue
+                      raise OperationalError("pull request page API response is malformed")
                   for summary in page:
                       if not isinstance(summary, dict):
-                          continue
+                          raise OperationalError("pull request summary API response is malformed")
                       number = summary.get("number")
                       if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-                          continue
+                          raise OperationalError("pull request summary has an invalid number")
                       pull_request = request(f"repos/{repository}/pulls/{number}")
-                      if (
+                      if not (
                           is_eligible_pull_request(pull_request, repository, default_branch)
                           and is_patch_update(pull_request.get("title"))
                       ):
-                          merge(number, pull_request["head"]["sha"])
+                          continue
+                      if not requirements_ready(number):
+                          log(f"PR #{number} not ready; retry later")
+                          continue
+
+                      pull_request = request(f"repos/{repository}/pulls/{number}")
+                      if not (
+                          is_eligible_pull_request(pull_request, repository, default_branch)
+                          and is_patch_update(pull_request.get("title"))
+                      ):
+                          log(f"PR #{number} changed before merge; skipped")
+                          continue
+                      head_sha = pull_request_head_sha(pull_request)
+                      if not pull_request_is_ready(pull_request):
+                          log(f"PR #{number} not ready; retry later")
+                          continue
+
+                      result = merge(number, head_sha)
+                      if result.returncode == 0:
+                          log(f"PR #{number} merged")
+                          continue
+
+                      refreshed = request(f"repos/{repository}/pulls/{number}")
+                      refreshed_head_sha = pull_request_head_sha(refreshed)
+                      if refreshed_head_sha is not None and refreshed_head_sha != head_sha:
+                          log(f"PR #{number} head changed before merge; skipped")
+                          continue
+                      if not (
+                          is_eligible_pull_request(refreshed, repository, default_branch)
+                          and is_patch_update(refreshed.get("title"))
+                      ):
+                          raise OperationalError(f"merge failed for PR #{number} after PR state changed")
+                      if not pull_request_is_ready(refreshed) or not requirements_ready(number):
+                          log(f"PR #{number} not ready; retry later")
+                          continue
+                      raise OperationalError(f"merge failed for PR #{number} (gh exit {result.returncode})")
 
 
           def main():
               repository = os.environ.get("GITHUB_REPOSITORY", "")
 
-              def enable_auto_merge(number, head_sha):
-                  try:
-                      subprocess.run(
-                          [
-                              "gh",
-                              "pr",
-                              "merge",
-                              "--repo",
-                              repository,
-                              "--auto",
-                              "--squash",
-                              "--match-head-commit",
-                              head_sha,
-                              str(number),
-                          ],
-                          check=False,
-                      )
-                  except OSError:
-                      pass
+              def merge(number, head_sha):
+                  return run(
+                      [
+                          "gh",
+                          "pr",
+                          "merge",
+                          "--repo",
+                          repository,
+                          "--squash",
+                          "--match-head-commit",
+                          head_sha,
+                          str(number),
+                      ]
+                  )
 
-              scan(api, enable_auto_merge, repository)
+              def requirements_ready(number):
+                  return required_checks_are_ready(number, repository)
+
+              try:
+                  scan(api, requirements_ready, merge, repository, print)
+              except OperationalError as error:
+                  print(f"dependabot-automerge: {error}", file=sys.stderr)
+                  return 1
+              return 0
 
 
           if __name__ == "__main__":
-              main()
+              raise SystemExit(main())
           PY
         env:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
