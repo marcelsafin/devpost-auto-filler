@@ -32,7 +32,6 @@ jobs:
           SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
           BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)$")
           COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-          READY_CHECK_BUCKETS = {"pass", "skipping"}
 
 
           class OperationalError(RuntimeError):
@@ -122,42 +121,6 @@ jobs:
                   raise OperationalError(f"API request returned invalid JSON for {endpoint}") from None
 
 
-          def required_checks_are_ready(number, repository):
-              result = run(
-                  [
-                      "gh",
-                      "pr",
-                      "checks",
-                      "--repo",
-                      repository,
-                      str(number),
-                      "--required",
-                      "--json",
-                      "bucket",
-                  ]
-              )
-              try:
-                  checks = json.loads(result.stdout)
-              except json.JSONDecodeError:
-                  raise OperationalError(f"required-check query returned invalid JSON for PR #{number}") from None
-              if not isinstance(checks, list) or any(
-                  not isinstance(check, dict) or not isinstance(check.get("bucket"), str) for check in checks
-              ):
-                  raise OperationalError(f"required-check query returned malformed data for PR #{number}")
-
-              buckets = {check["bucket"] for check in checks}
-              if result.returncode == 0:
-                  if buckets <= READY_CHECK_BUCKETS:
-                      return True
-              elif result.returncode == 8:
-                  if "pending" in buckets:
-                      return False
-              elif result.returncode == 1:
-                  if buckets & {"fail", "cancel"}:
-                      return False
-              raise OperationalError(f"required-check query failed for PR #{number} (gh exit {result.returncode})")
-
-
           def pull_request_is_ready(pull_request):
               mergeable = pull_request.get("mergeable")
               mergeable_state = pull_request.get("mergeable_state")
@@ -166,7 +129,7 @@ jobs:
               return mergeable is True and mergeable_state == "clean"
 
 
-          def scan(request, requirements_ready, merge, repository, log):
+          def scan(request, merge, repository, log):
               if not isinstance(repository, str) or not repository:
                   raise OperationalError("GITHUB_REPOSITORY is missing or invalid")
               details = request(f"repos/{repository}")
@@ -193,9 +156,6 @@ jobs:
                           is_eligible_pull_request(pull_request, repository, default_branch)
                           and is_patch_update(pull_request.get("title"))
                       ):
-                          continue
-                      if not requirements_ready(number):
-                          log(f"PR #{number} not ready; retry later")
                           continue
 
                       pull_request = request(f"repos/{repository}/pulls/{number}")
@@ -225,7 +185,7 @@ jobs:
                           and is_patch_update(refreshed.get("title"))
                       ):
                           raise OperationalError(f"merge failed for PR #{number} after PR state changed")
-                      if not pull_request_is_ready(refreshed) or not requirements_ready(number):
+                      if not pull_request_is_ready(refreshed):
                           log(f"PR #{number} not ready; retry later")
                           continue
                       raise OperationalError(f"merge failed for PR #{number} (gh exit {result.returncode})")
@@ -249,11 +209,8 @@ jobs:
                       ]
                   )
 
-              def requirements_ready(number):
-                  return required_checks_are_ready(number, repository)
-
               try:
-                  scan(api, requirements_ready, merge, repository, print)
+                  scan(api, merge, repository, print)
               except OperationalError as error:
                   print(f"dependabot-automerge: {error}", file=sys.stderr)
                   return 1
