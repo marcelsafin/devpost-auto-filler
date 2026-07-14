@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const selfRelativePath = path.relative(repoRoot, fileURLToPath(import.meta.url));
+const selfTestCommand = `node --test ${selfRelativePath}`;
 
 function trackedFiles() {
   return execSync('git ls-files', { cwd: repoRoot, encoding: 'utf8' })
@@ -66,6 +67,14 @@ test('no tracked file contains Gemini/AI integration references or an API key', 
       content = readFileSync(full, 'utf8');
     } catch {
       continue; // binary file, not a text reference
+    }
+
+    if (file === 'package.json') {
+      const pkg = JSON.parse(content);
+      if (pkg.scripts?.test === selfTestCommand) {
+        pkg.scripts.test = '';
+        content = JSON.stringify(pkg);
+      }
     }
 
     for (const { name, re } of FORBIDDEN_PATTERNS) {
