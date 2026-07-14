@@ -2,15 +2,7 @@
   "manifest_version": 3,
   "name": "Devpost Auto-Filler",
   "version": "1.0",
-  "description": "Fyller automatiskt i Devpost-inlämningar med ett klick.",
-  "permissions": [
-    "activeTab",
-    "scripting"
-  ],
-  "host_permissions": [
-    "https://*.devpost.com/*",
-    "https://devpost.com/*"
-  ],
+  "description": "Laddar ett minimalt Devpost-content script utan externa AI-anrop.",
   "content_scripts": [
     {
       "matches": ["https://*.devpost.com/*", "https://devpost.com/*"],
