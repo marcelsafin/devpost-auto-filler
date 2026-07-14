@@ -4,7 +4,7 @@
 
 # Devpost Auto-Filler
 
-A Chrome extension that helps with Devpost hackathon submissions.
+A minimal Chrome extension scaffold that logs when Devpost pages load.
 
 ## Run Locally
 

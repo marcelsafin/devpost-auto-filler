@@ -15,9 +15,15 @@ const selfRelativePath = path.relative(repoRoot, fileURLToPath(import.meta.url))
 const selfTestCommand = `node --test ${selfRelativePath}`;
 
 function trackedFiles() {
-  return execSync('git ls-files', { cwd: repoRoot, encoding: 'utf8' })
-    .split('\n')
-    .filter(Boolean);
+  try {
+    return execSync('git ls-files', { cwd: repoRoot, encoding: 'utf8' })
+      .split('\n')
+      .filter(Boolean);
+  } catch (error) {
+    throw new Error('Security regression tests require Git and a Git checkout.', {
+      cause: error,
+    });
+  }
 }
 
 // Patterns that must never appear in tracked source again. This intentionally

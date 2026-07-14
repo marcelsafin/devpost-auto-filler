@@ -1,5 +1,5 @@
 {
   "name": "Devpost Auto-Filler",
-  "description": "A Chrome extension to help automate the submission process for the Cloud Run Hackathon on Devpost.com.",
+  "description": "A minimal Chrome extension scaffold that logs when Devpost pages load.",
   "requestFramePermissions": []
 }
