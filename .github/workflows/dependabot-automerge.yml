@@ -30,10 +30,10 @@ jobs:
           from urllib.parse import urlencode
 
           SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
-          BUMP_TITLE = re.compile(r"^Bump ([^\s]+) from (\S+) to (\S+)(?: in (\S+))?$")
+          BUMP_TITLE = re.compile(r"\ABump ([^\s]+) from (\S+) to (\S+)(?: in (.+))?\Z")
           COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
           HTTP_STATUS = re.compile(r"^HTTP/\d(?:\.\d+)?\s+([1-5]\d\d)(?:\s|$)")
-          ALLOWED_DIRECTORIES = ('/',)
+          ALLOWED_DIRECTORIES = ["/"]
 
 
           class OperationalError(RuntimeError):
